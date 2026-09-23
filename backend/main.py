@@ -80,26 +80,55 @@ app.add_middleware(
 )
 
 
-def estimate_total_pages(title: str, author: Optional[str]) -> Optional[int]:
+def estimate_book_details(title: str, author: Optional[str], genre: Optional[str], total_pages: Optional[int]):
+    """Use Gemini to fill in missing author, genre, and page count in one call."""
+    missing = []
+    if not author:
+        missing.append("author")
+    if not genre:
+        missing.append("genre")
+    if not total_pages:
+        missing.append("total_pages")
+
+    if not missing:
+        return author, genre, total_pages
+
     prompt = (
-        f"What is the approximate total page count of the book '{title}'"
-        f"{f' by {author}' if author else ''}? "
-        "Respond with ONLY a single integer number, nothing else."
+        f"For the book titled '{title}', provide the following missing fields: {', '.join(missing)}. "
+        "Respond in EXACTLY this format, one per line, nothing else:\n"
+        "author: <name or Unknown>\n"
+        "genre: <one or two word genre or Unknown>\n"
+        "total_pages: <integer or 0>"
     )
     try:
         response = model.generate_content(prompt)
-        digits = "".join(c for c in response.text.strip() if c.isdigit())
-        return int(digits) if digits else None
+        lines = response.text.strip().splitlines()
+        result = {}
+        for line in lines:
+            if ":" in line:
+                key, val = line.split(":", 1)
+                result[key.strip().lower()] = val.strip()
+
+        final_author = author or (result.get("author") if result.get("author", "Unknown") != "Unknown" else None)
+        final_genre = genre or (result.get("genre") if result.get("genre", "Unknown") != "Unknown" else None)
+        digits = "".join(c for c in result.get("total_pages", "") if c.isdigit())
+        final_pages = total_pages or (int(digits) if digits else None)
+
+        return final_author, final_genre, final_pages
     except Exception:
-        return None
+        return author, genre, total_pages
 
 
 @app.post("/books")
 def add_book(book: BookCreate):
     db = SessionLocal()
     data = book.dict()
-    if not data.get("total_pages"):
-        data["total_pages"] = estimate_total_pages(data["title"], data.get("author"))
+    author, genre, total_pages = estimate_book_details(
+        data["title"], data.get("author"), data.get("genre"), data.get("total_pages")
+    )
+    data["author"] = author
+    data["genre"] = genre
+    data["total_pages"] = total_pages
     new_book = Book(**data)
     db.add(new_book)
     db.commit()
@@ -243,12 +272,15 @@ def recommend_books():
     db = SessionLocal()
     books = db.query(Book).all()
     db.close()
-    completed = [b for b in books if b.status == "completed"]
-    if not completed:
-        return {"recommendations": "Add and complete a few books first so I can recommend based on your taste."}
-    titles = ", ".join(f"{b.title} ({b.genre})" for b in completed)
+
+    relevant = [b for b in books if b.status in ("completed", "reading")]
+
+    if len(relevant) < 2:
+        return {"recommendations": "Add at least 2 books (reading or completed) so I can recommend based on your taste."}
+
+    titles = ", ".join(f"{b.title} ({b.genre or 'Unknown genre'})" for b in relevant)
     prompt = (
-        f"Based on someone who has read and enjoyed: {titles}, "
+        f"Based on someone who is reading or has read: {titles}, "
         "recommend 3 new book titles (with author) they might like. "
         "Keep it short, just a numbered list with one-line reasons."
     )
